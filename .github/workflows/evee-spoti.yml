@@ -7,19 +7,6 @@ on:
         description: 'Direct HTTPS link to a clean decrypted Spotify IPA (or use SPOTIFY_IPA_URL secret)'
         required: false
         type: string
-      eevee_deb_url:
-        description: 'Direct HTTPS link to EeveeSpotifyReincarnated .deb (normal arm64, not roothide)'
-        required: true
-        type: string
-      spoti_ref:
-        description: 'spoti.pw commit, tag or branch (default: inspected 0.22.0 commit)'
-        required: true
-        default: 'f0fd8efd996719b8cf70adb3553be5c687af6b8e'
-        type: string
-      eevee_sha256:
-        description: 'Optional expected SHA-256 of the Eevee .deb'
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -38,11 +25,97 @@ jobs:
 
     steps:
       # No checkout of the hosting repository is needed: this file is standalone.
+      - name: Select Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Find latest stable upstream releases
+        id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re, time, urllib.error, urllib.parse, urllib.request
+
+          def api(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'spotify-combined-workflow',
+              })
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(request, timeout=60) as response:
+                          return json.load(response)
+                  except urllib.error.HTTPError as error:
+                      if error.code >= 500 and attempt < 2:
+                          time.sleep(2 ** attempt)
+                          continue
+                      raise SystemExit(f'GitHub API returned HTTP {error.code} for {path}. Retry later or check the upstream release.')
+                  except (urllib.error.URLError, TimeoutError):
+                      if attempt < 2:
+                          time.sleep(2 ** attempt)
+                          continue
+                      raise SystemExit('Could not reach GitHub to resolve the latest releases.')
+
+          def latest(repo):
+              release = api(repo + '/releases/latest')
+              if release.get('draft') or release.get('prerelease') or not release.get('tag_name'):
+                  raise SystemExit(f'{repo}: expected a published stable release.')
+              return release
+
+          spoti_repo = 'skopevoj/spoti.pw'
+          eevee_repo = 'SideloadLabs/EeveeSpotifyReincarnated'
+          spoti = latest(spoti_repo)
+          eevee = latest(eevee_repo)
+          # Resolve the selected release tag to a commit so this run cannot drift.
+          commit = api(spoti_repo + '/commits/' + urllib.parse.quote(spoti['tag_name'], safe=''))['sha']
+          if not re.fullmatch(r'[0-9a-f]{40}', commit):
+              raise SystemExit('GitHub returned an invalid spoti.pw commit.')
+          assets = [a for a in eevee.get('assets', [])
+                    if a.get('state') == 'uploaded'
+                    and a.get('name', '').lower().endswith('.deb')
+                    and not any(x in a['name'].lower() for x in ('roothide', 'arm64e', 'debug'))]
+          arm64 = [a for a in assets if re.search(r'(?:^|[-_])arm64(?:[-_.]|$)', a['name'].lower())]
+          candidates = arm64 or [a for a in assets if 'iphoneos-arm.' in a['name'].lower()]
+          if len(candidates) != 1:
+              raise SystemExit('Latest Eevee release must contain exactly one normal arm64 .deb. '
+                               'No older release or roothide build will be silently substituted. '
+                               'Available .deb assets: ' + ', '.join(a['name'] for a in assets))
+          asset = candidates[0]
+          url = asset['browser_download_url']
+          if not url.startswith('https://github.com/' + eevee_repo + '/releases/download/'):
+              raise SystemExit('Eevee asset URL does not belong to the expected upstream repository.')
+          digest = asset.get('digest') or ''
+          sha256 = digest.removeprefix('sha256:') if digest.startswith('sha256:') else ''
+          if sha256 and not re.fullmatch(r'[0-9a-f]{64}', sha256):
+              raise SystemExit('Invalid release asset SHA-256 digest.')
+          if not sha256:
+              print('::warning::GitHub did not provide an Eevee asset SHA-256; its downloaded checksum will still be recorded.')
+          values = {'spoti_commit': commit, 'spoti_tag': spoti['tag_name'],
+                    'eevee_tag': eevee['tag_name'], 'eevee_url': url,
+                    'eevee_sha256': sha256, 'eevee_asset': asset['name']}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key, value in values.items():
+                  if any(c in value for c in '\r\n'):
+                      raise SystemExit('Unexpected multiline GitHub release metadata.')
+                  out.write(f'{key}={value}\n')
+          print(f"Selected spoti.pw {spoti['tag_name']} ({commit})")
+          print(f"Selected Eevee {eevee['tag_name']}: {asset['name']}")
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### Automatically selected upstream releases\n\n')
+              summary.write(f"- spoti.pw: **{spoti['tag_name']}**\n- Eevee: **{eevee['tag_name']}**\n\n")
+              summary.write('Latest stable releases are selected afresh on every run. Their compatibility with your IPA still depends on upstream support.\n\n')
+          PY
+
       - name: Check out spoti.pw
         uses: actions/checkout@v5
         with:
           repository: skopevoj/spoti.pw
-          ref: ${{ inputs.spoti_ref }}
+          ref: ${{ steps.releases.outputs.spoti_commit }}
           path: spoti
           submodules: recursive
           persist-credentials: false
@@ -51,11 +124,6 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
-
-      - name: Select Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
 
       - name: Check out Theos
         uses: actions/checkout@v5
@@ -85,8 +153,8 @@ jobs:
         env:
           IPA_URL_INPUT: ${{ inputs.ipa_url }}
           IPA_URL_SECRET: ${{ secrets.SPOTIFY_IPA_URL }}
-          EEVEE_URL: ${{ inputs.eevee_deb_url }}
-          EEVEE_SHA256: ${{ inputs.eevee_sha256 }}
+          EEVEE_URL: ${{ steps.releases.outputs.eevee_url }}
+          EEVEE_SHA256: ${{ steps.releases.outputs.eevee_sha256 }}
         run: |
           set -euo pipefail
           # Treat workflow inputs as data, never as shell source.
@@ -154,8 +222,7 @@ jobs:
               raise SystemExit('Spotify executable is encrypted. Supply a decrypted IPA.')
           version = str(info.get('CFBundleShortVersionString', 'unknown'))
           print(f'Spotify version: {version}')
-          if version != '9.1.78':
-              print('::warning::The inspected spoti.pw version is tested on Spotify 9.1.78. Other versions may crash.')
+          print('Latest tweak releases were selected independently. Check the selected releases for support of this Spotify version.')
           (work / 'spotify-version.txt').write_text(version)
           PY
           dpkg-deb --info "$WORK/eevee.deb"
@@ -202,6 +269,10 @@ jobs:
           PY
 
       - name: Verify combined IPA and record build details
+        env:
+          SPOTI_RELEASE: ${{ steps.releases.outputs.spoti_tag }}
+          EEVEE_RELEASE: ${{ steps.releases.outputs.eevee_tag }}
+          EEVEE_ASSET: ${{ steps.releases.outputs.eevee_asset }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -256,6 +327,9 @@ jobs:
           report = {
               'spotify_version': (work / 'spotify-version.txt').read_text(),
               'spoti_version': (workspace / 'spoti/version.txt').read_text().strip(),
+              'spoti_release': os.environ['SPOTI_RELEASE'],
+              'eevee_release': os.environ['EEVEE_RELEASE'],
+              'eevee_asset': os.environ['EEVEE_ASSET'],
               'spoti_commit': git_sha(workspace / 'spoti'),
               'theos_commit': git_sha(workspace / 'theos'),
               'cyan_commit': os.environ['CYAN_REF'],
