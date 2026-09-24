@@ -20,11 +20,13 @@ jobs:
         shell: bash
     env:
       THEOS: ${{ github.workspace }}/theos
-      WORK: ${{ runner.temp }}/spotify-combined
       CYAN_REF: '740d3716dcd98c20c000f12cdb88f1f0b2a533a4'
 
     steps:
       # No checkout of the hosting repository is needed: this file is standalone.
+      - name: Initialize working directory
+        run: echo "WORK=$RUNNER_TEMP/spotify-combined" >> "$GITHUB_ENV"
+
       - name: Select Python
         uses: actions/setup-python@v5
         with:
